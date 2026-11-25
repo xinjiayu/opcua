@@ -15,6 +15,27 @@ import (
 
 type Handler func(*uasc.SecureChannel, ua.Request, uint32) (ua.Response, error)
 
+// sessionlessServices is the allowlist of the services a client may call
+// without a session: the ones it needs to find a server and to establish the
+// session in the first place. OPC UA Part 4 requires a session for every
+// other service and Bad_SessionIdInvalid as the answer when it is missing.
+// CloseSession is deliberately absent, since it closes a session that has to
+// exist.
+//
+// This is an allowlist and not a denylist on purpose. A denylist would let
+// every service that is added later, here or by an application through
+// RegisterHandler, run without a session until somebody remembers to list it.
+// With an allowlist a new service is protected by default.
+var sessionlessServices = map[uint16]struct{}{
+	id.FindServersRequest_Encoding_DefaultBinary:          {},
+	id.FindServersOnNetworkRequest_Encoding_DefaultBinary: {},
+	id.GetEndpointsRequest_Encoding_DefaultBinary:         {},
+	id.RegisterServerRequest_Encoding_DefaultBinary:       {},
+	id.RegisterServer2Request_Encoding_DefaultBinary:      {},
+	id.CreateSessionRequest_Encoding_DefaultBinary:        {},
+	id.ActivateSessionRequest_Encoding_DefaultBinary:      {},
+}
+
 func (s *Server) initHandlers() {
 	// s.registerHandlerFunc(id.ServiceFault_Encoding_DefaultBinary, handleServiceFault)
 
@@ -110,15 +131,28 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 
 	typeID := ua.ServiceTypeID(req)
 	h, ok := s.handlers[typeID]
-	if ok {
-		resp, err = h(sc, req, reqID)
-	} else {
+	if !ok {
 		if typeID == 0 {
 			if s.cfg.logger != nil {
 				s.cfg.logger.Warn("unknown service %T. Did you call register?", req)
 			}
 		}
 		err = ua.StatusBadServiceUnsupported
+	} else if sess := s.sessionFor(req); sess != nil {
+		// A request that names a session the server knows counts as activity
+		// and starts the timeout of that session over.
+		s.sb.touch(sess)
+		resp, err = h(sc, req, reqID)
+	} else if _, sessionless := sessionlessServices[typeID]; !sessionless {
+		// OPC UA Part 4: everything but discovery and setting up the session
+		// needs a session the server knows. Upstream ran the handler anyway,
+		// so a Read, Write or Browse without a session returned real data.
+		if s.cfg.logger != nil {
+			s.cfg.logger.Debug("handleService: rejected %T, it carries no valid session\n", req)
+		}
+		err = ua.StatusBadSessionIDInvalid
+	} else {
+		resp, err = h(sc, req, reqID)
 	}
 
 	if err != nil {
@@ -139,6 +173,20 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 			s.cfg.logger.Warn("Error sending response: %s\n", err)
 		}
 	}
+}
+
+// sessionFor returns the session a request names, or nil when it carries no
+// token the server knows.
+//
+// Unlike sessionBroker.Session it stays silent on a miss. Requests without a
+// session are routine before the session exists and are logged where they are
+// rejected, not on every GetEndpoints.
+func (s *Server) sessionFor(req ua.Request) *session {
+	hdr := req.Header()
+	if hdr == nil || hdr.AuthenticationToken == nil {
+		return nil
+	}
+	return s.sb.lookup(hdr.AuthenticationToken)
 }
 
 func responseHeader(reqID uint32, statusCode ua.StatusCode) *ua.ResponseHeader {

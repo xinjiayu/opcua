@@ -109,9 +109,11 @@ func suitableRefType(srv *Server, ref1, ref2 *ua.NodeID, subtypes bool) bool {
 	hasSubtypeFn := func(nid *ua.NodeID) bool { return nid.Equal(hasSubtype) }
 	oktypes := getSubRefs(srv, ref1)
 	if !subtypes && slices.ContainsFunc(oktypes, hasSubtypeFn) {
-		for n := slices.IndexFunc(oktypes, hasSubtypeFn); n > 0; {
-			oktypes = slices.Delete(oktypes, n, n+1)
-		}
+		// Upstream removed HasSubtype with a loop whose index never changed
+		// while the slice shrank on every pass. As soon as HasSubtype was not
+		// the first entry it deleted the wrong elements and then ran off the
+		// end of the slice, killing the process. See PATCHES.md (P2).
+		oktypes = slices.DeleteFunc(oktypes, hasSubtypeFn)
 	}
 	return slices.ContainsFunc(oktypes, hasRef2Fn)
 }

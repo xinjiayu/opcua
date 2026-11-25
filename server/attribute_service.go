@@ -84,6 +84,10 @@ func (s *AttributeService) Write(sc *uasc.SecureChannel, r ua.Request, reqID uin
 		ns, err := s.srv.Namespace(int(n.NodeID.Namespace()))
 		if err != nil {
 			status[i] = ua.StatusBadNodeNotInView
+			// ns is nil here. Without the continue the loop went on to call
+			// SetAttribute on it and crashed the process. Ported from v0.9.3,
+			// see PATCHES.md (P1).
+			continue
 		}
 
 		status[i] = ns.SetAttribute(n.NodeID, n.AttributeID, n.Value)

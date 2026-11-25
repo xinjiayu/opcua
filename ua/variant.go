@@ -116,7 +116,20 @@ func (m *Variant) Value() interface{} {
 
 // Decode implements the codec interface.
 func (m *Variant) Decode(b []byte) (int, error) {
+	return m.decodeNested(b, 0)
+}
+
+// decodeNested decodes a Variant that has depth levels of Variants,
+// DiagnosticInfos and ExtensionObjects around it. Each of them is one step of
+// recursion here, so the depth is capped at maxNestingDepth (P12).
+func (m *Variant) decodeNested(b []byte, depth int) (int, error) {
+	if depth > maxNestingDepth {
+		return 0, errTooDeeplyNested
+	}
+
 	buf := NewBuffer(b)
+	// whatever this Variant holds sits one level deeper
+	buf.depth = depth + 1
 	m.mask = buf.ReadByte()
 
 	// a null value specifies that no other fields are encoded
@@ -313,12 +326,10 @@ func (m *Variant) decodeValue(buf *Buffer) interface{} {
 		buf.ReadStruct(v)
 		return v
 	case TypeIDVariant:
-		// todo(fs): limit recursion depth to 100
 		v := new(Variant)
 		buf.ReadStruct(v)
 		return v
 	case TypeIDDiagnosticInfo:
-		// todo(fs): limit recursion depth to 100
 		v := new(DiagnosticInfo)
 		buf.ReadStruct(v)
 		return v

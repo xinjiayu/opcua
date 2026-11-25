@@ -316,25 +316,17 @@ func (c *Conn) srvhandshake(endpoint string) error {
 		return nil
 
 	case "RHEF":
-		rhe := new(ReverseHello)
-		if _, err := rhe.Decode(msg); err != nil {
-			c.SendError(ua.StatusBadTCPInternalError)
-			return err
-		}
-		if rhe.EndpointURL != endpoint {
-			c.SendError(ua.StatusBadTCPEndpointURLInvalid)
-			return errors.Errorf("uacp: invalid endpoint url %s", rhe.EndpointURL)
-		}
-		debug.Printf("uacp %d: connecting to %s", c.id, rhe.ServerURI)
-		c.Close()
-		var dialer net.Dialer
-		c2, err := dialer.DialContext(context.Background(), "tcp", rhe.ServerURI)
-		if err != nil {
-			return err
-		}
-		c.TCPConn = c2.(*net.TCPConn)
-		debug.Printf("uacp %d: recv %#v", c.id, rhe)
-		return nil
+		// A ReverseHello asks the server to connect to an address the client
+		// names in it. It belongs to reverse connect, which this server is
+		// never set up for, so it is refused on every listener.
+		//
+		// Upstream dialled that address whenever the EndpointUrl in the
+		// message named the configured endpoint. Nothing switched that on,
+		// so any client that could reach the listening port could make the
+		// server open a TCP connection to any host and port (P10). The
+		// message is not even decoded: nothing in it is acted upon.
+		c.SendError(ua.StatusBadTCPEndpointURLInvalid)
+		return errors.Errorf("uacp: reverse hello is not supported")
 
 	case "ERRF":
 		errf := new(Error)

@@ -30,12 +30,59 @@ type BinaryDecoder interface {
 	Decode([]byte) (int, error)
 }
 
-func Decode(b []byte, v interface{}) (int, error) {
-	val := reflect.ValueOf(v)
-	return decode(b, val, val.Type().String())
+// maxNestingDepth is how many Variants, DiagnosticInfos and ExtensionObjects
+// a value may be nested in. OPC UA Part 6 allows a Variant to be nested one
+// level deep, so 100, the number upstream's own comment asked for, leaves
+// room for any real message.
+//
+// These three are the only decoders written by hand that decode values inside
+// themselves, and every generated type is a tree, so capping them caps every
+// way the decoder can recurse. Without the limit every level of nesting was
+// one byte on the wire for a Variant or a DiagnosticInfo and nine for an
+// ExtensionObject, each one a step of recursion. A message of about a
+// megabyte sent the decoding goroutine past the gigabyte Go allows a stack to
+// grow to, which is a fatal error no recover catches, and it happened before
+// any check for a session (P12). A two megabyte message of nested
+// ExtensionObjects did not quite get there but took half a gigabyte of stack.
+//
+// The depth belongs to the value being decoded and is passed along with it.
+// Nothing in the package counts it: messages are decoded concurrently.
+const maxNestingDepth = 100
+
+// errTooDeeplyNested is returned for a value nested deeper than
+// maxNestingDepth.
+var errTooDeeplyNested = errors.Errorf("nested more than %d Variants, DiagnosticInfos or ExtensionObjects deep", maxNestingDepth)
+
+// depthAware is implemented by the decoders written by hand that decode
+// values inside themselves: Variant, DiagnosticInfo and ExtensionObject,
+// which are a level of nesting each, and DataValue, which only wraps one.
+//
+// depth is the number of levels around the value.
+type depthAware interface {
+	decodeNested(b []byte, depth int) (int, error)
 }
 
-func decode(b []byte, val reflect.Value, name string) (n int, err error) {
+// decodeBinary hands b to the Decode of a type written by hand. The types
+// that decode values inside themselves are told how deep they are. The others
+// cannot lead back to a Variant or a DiagnosticInfo, so for them every
+// message starts at the top.
+func decodeBinary(val reflect.Value, b []byte, depth int) (int, error) {
+	switch v := val.Interface().(type) {
+	case depthAware:
+		return v.decodeNested(b, depth)
+	case BinaryDecoder:
+		return v.Decode(b)
+	default:
+		return 0, errors.Errorf("unsupported type %s", val.Type())
+	}
+}
+
+func Decode(b []byte, v interface{}) (int, error) {
+	val := reflect.ValueOf(v)
+	return decode(b, val, val.Type().String(), 0)
+}
+
+func decode(b []byte, val reflect.Value, name string, depth int) (n int, err error) {
 	if debugCodec {
 		fmt.Printf("decode: %s has type %v and is a %s, %d bytes\n", name, val.Type(), val.Type().Kind(), len(b))
 		defer func() {
@@ -46,8 +93,7 @@ func decode(b []byte, val reflect.Value, name string) (n int, err error) {
 	buf := NewBuffer(b)
 	switch {
 	case isBinaryDecoder(val):
-		v := val.Interface().(BinaryDecoder)
-		return v.Decode(b)
+		return decodeBinary(val, b, depth)
 	case isTime(val):
 		val.Set(reflect.ValueOf(buf.ReadTime()).Convert(val.Type()))
 	default:
@@ -78,13 +124,13 @@ func decode(b []byte, val reflect.Value, name string) (n int, err error) {
 		case reflect.String:
 			val.SetString(buf.ReadString())
 		case reflect.Slice:
-			return decodeSlice(b, val, name)
+			return decodeSlice(b, val, name, depth)
 		case reflect.Array:
-			return decodeArray(b, val, name)
+			return decodeArray(b, val, name, depth)
 		case reflect.Ptr:
-			return decode(b, val.Elem(), name)
+			return decode(b, val.Elem(), name, depth)
 		case reflect.Struct:
-			return decodeStruct(b, val, name)
+			return decodeStruct(b, val, name, depth)
 		default:
 			return 0, errors.Errorf("unsupported type %s", val.Type())
 		}
@@ -92,7 +138,7 @@ func decode(b []byte, val reflect.Value, name string) (n int, err error) {
 	return buf.Pos(), buf.Error()
 }
 
-func decodeStruct(b []byte, val reflect.Value, name string) (int, error) {
+func decodeStruct(b []byte, val reflect.Value, name string, depth int) (int, error) {
 	pos := 0
 	valt := val.Type()
 	for i := 0; i < val.NumField(); i++ {
@@ -107,7 +153,7 @@ func decodeStruct(b []byte, val reflect.Value, name string) (int, error) {
 			// fmt.Printf("decode: %s has type %v and has new value %#v\n", fname, f.Type(), f.Interface())
 		}
 
-		n, err := decode(b[pos:], f, fname)
+		n, err := decode(b[pos:], f, fname, depth)
 		if err != nil {
 			return pos, err
 		}
@@ -116,7 +162,7 @@ func decodeStruct(b []byte, val reflect.Value, name string) (int, error) {
 	return pos, nil
 }
 
-func decodeSlice(b []byte, val reflect.Value, name string) (int, error) {
+func decodeSlice(b []byte, val reflect.Value, name string, depth int) (int, error) {
 	buf := NewBuffer(b)
 	n := buf.ReadUint32()
 	if buf.Error() != nil {
@@ -144,6 +190,16 @@ func decodeSlice(b []byte, val reflect.Value, name string) (int, error) {
 	}
 
 	pos := buf.Pos()
+	// The element count comes straight off the wire and the only prior check is
+	// n > math.MaxInt32, so a tiny message can still declare hundreds of millions
+	// of elements and force a huge MakeSlice before any element byte is read. Each
+	// element occupies at least one byte on the wire, so a count larger than the
+	// bytes remaining can never be satisfied. Reject it here to keep the allocation
+	// bounded by the actual input size.
+	if int(n) > buf.Len() {
+		return pos, errors.Errorf("array length %d exceeds remaining %d bytes", n, buf.Len())
+	}
+
 	// a is a slice of []*Foo
 	a := reflect.MakeSlice(val.Type(), int(n), int(n))
 	for i := 0; i < int(n); i++ {
@@ -155,7 +211,7 @@ func decodeSlice(b []byte, val reflect.Value, name string) (int, error) {
 		}
 
 		ename := fmt.Sprintf("%s[%d]", name, i)
-		m, err := decode(b[pos:], a.Index(i), ename)
+		m, err := decode(b[pos:], a.Index(i), ename, depth)
 		if err != nil {
 			return pos, err
 		}
@@ -166,7 +222,7 @@ func decodeSlice(b []byte, val reflect.Value, name string) (int, error) {
 	return pos, nil
 }
 
-func decodeArray(b []byte, val reflect.Value, name string) (int, error) {
+func decodeArray(b []byte, val reflect.Value, name string, depth int) (int, error) {
 	buf := NewBuffer(b)
 	n := buf.ReadUint32()
 	if buf.Error() != nil {
@@ -209,7 +265,7 @@ func decodeArray(b []byte, val reflect.Value, name string) (int, error) {
 		}
 
 		ename := fmt.Sprintf("%s[%d]", name, i)
-		m, err := decode(b[pos:], a.Index(i), ename)
+		m, err := decode(b[pos:], a.Index(i), ename, depth)
 		if err != nil {
 			return pos, err
 		}

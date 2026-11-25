@@ -48,7 +48,23 @@ func NewExtensionObject(value interface{}) *ExtensionObject {
 }
 
 func (e *ExtensionObject) Decode(b []byte) (int, error) {
+	return e.decodeNested(b, 0)
+}
+
+// decodeNested decodes an ExtensionObject that has depth Variants,
+// DiagnosticInfos and ExtensionObjects around it. Each of them is one step of
+// recursion here, so the depth is capped at maxNestingDepth (P12).
+//
+// What it carries gets the depth one level down, whether it is decoded by
+// hand or through the reflection in decode.go. Without carrying the depth on,
+// a Variant in an ExtensionObject in a Variant began at the top again.
+func (e *ExtensionObject) decodeNested(b []byte, depth int) (int, error) {
+	if depth > maxNestingDepth {
+		return 0, errTooDeeplyNested
+	}
+
 	buf := NewBuffer(b)
+	buf.depth = depth + 1
 	e.TypeID = new(ExpandedNodeID)
 	buf.ReadStruct(e.TypeID)
 
@@ -66,6 +82,7 @@ func (e *ExtensionObject) Decode(b []byte) (int, error) {
 	if buf.Error() != nil {
 		return buf.Pos(), buf.Error()
 	}
+	body.depth = depth + 1
 
 	if e.EncodingMask == ExtensionObjectXML {
 		e.Value = new(XMLElement)
