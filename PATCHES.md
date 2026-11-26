@@ -92,8 +92,8 @@ SagooIoT 的南向采集插件 `plugins/opcua` 是独立模块，生产构建用
 
 行号均指 `sagooiot-v0.9.3` 分支的当前状态。各条下面的「未打补丁时的失败表现」是换基线当天在这个基线上
 逐条撤掉补丁后重新采集的：**11 条补丁每撤掉一条，针对它的测试都会变红**，没有一条是多余的；
-其中的行号是未打补丁的上游 v0.9.3 里出错的位置。P1、P3、P7a 上游已修，在 v0.9.3 上复现不出来，
-它们的证据取自 `sagooiot-v0.8.0` 分支。
+其中的行号是未打补丁的上游 v0.9.3 里出错的位置。P1、P3、P7a 上游已修，它们的「未打补丁时的失败表现」
+是在 v0.9.3 上把上游的修复撤回去之后采集的，同样不取自 v0.8.0。
 
 ## 3. 逐条补丁
 
@@ -111,7 +111,7 @@ SagooIoT 的南向采集插件 `plugins/opcua` 是独立模块，生产构建用
 - **上游参考**：v0.9.3 已修，做法就是补 `continue`。
 - **测试**：`server/patch_p1_write_test.go` — `TestWriteUnregisteredNamespace`
   （三个用例：只有未注册命名空间、未注册在前、未注册在后；后两个确认结果与请求仍然一一对齐）。
-- **未打补丁时的失败表现**（上游 v0.8.0 上采集）：
+- **未打补丁时的失败表现**（在 v0.9.3 上把 `Write` 换回上游 v0.8.0 的写法后采集）：
   ```
   patch_p1_write_test.go:40: unregistered-only: probe child did not exit cleanly ... exit status 2
   panic: runtime error: invalid memory address or nil pointer dereference
@@ -185,13 +185,13 @@ SagooIoT 的南向采集插件 `plugins/opcua` 是独立模块，生产构建用
     - `TestDecodeArrayLengthIsBoundedByArrayType` — 钉住 `decodeArray` 的现状
   - `server/patch_p3_client_test.go` — `TestClientDecodesLargeRealResponses`：
     用本库的客户端解真实的服务端响应（500 个结果的 `ReadResponse`、带引用的 `BrowseResponse`）
-- **未打补丁时的失败表现**（上游 v0.8.0 上采集）：
+- **未打补丁时的失败表现**（在 v0.9.3 上撤掉这段检查后采集）：
   ```
   decoding 45 bytes that declare 50000000 elements allocated 400061504 bytes
   Error "unexpected EOF" does not contain "array length 50000000 exceeds remaining 0 bytes"
   "400061504" is not less than "1048576"
   ```
-  打补丁后同一输入：`allocated 1008 bytes`。
+  上游的检查生效时同一输入：`allocated 912 bytes`。
 
 ### P4　订阅服务
 
@@ -267,11 +267,12 @@ SagooIoT 的南向采集插件 `plugins/opcua` 是独立模块，生产构建用
   DeleteMonitoredItems:   nil pointer dereference   monitored_item_service.go:351
   SetMonitoringMode:      nil pointer dereference   monitored_item_service.go:287
 
-  别的会话 SetMonitoringMode: results=[StatusGood], item mode afterwards=MonitoringModeDisabled
-  别的会话 DeleteMonitoredItems: results=[StatusGood], item still exists=false
+  只关掉 itemStatus 里的令牌比较时，对别的会话的监视项（11 号）：
+  DeleteMonitoredItems:  results for [11 999999] = [StatusGood, BadMonitoredItemIDInvalid]
+  SetMonitoringMode:     同上
   ```
-  前两行是撤掉补丁后两个崩溃用例的直接输出；后两行取自只撤掉所有权检查时的探针，
-  这段代码上游在两个版本之间没有改动。
+  前两行是撤掉整条补丁后两个崩溃用例的直接输出；后两行是在 v0.9.3 上只关掉 `itemStatus` 里的
+  令牌比较时采的：别的会话的监视项操作成功，不存在的监视项号（999999）仍然报无效。
 
 ### P6　集中的会话校验
 
@@ -330,21 +331,21 @@ SagooIoT 的南向采集插件 `plugins/opcua` 是独立模块，生产构建用
 - **问题**：原常量注释写的是毫秒，却是无类型的整数；`sess.cfg.sessionTimeout` 是 `time.Duration`，
   单位是纳秒。于是「上限 1800000」实际是 1.8 毫秒，「下限 100」实际是 100 纳秒，
   任何大于 1.8 毫秒的请求都被判为越界，换成「默认值」60000 纳秒，也就是 60 微秒。
-- **探针证据**（未打补丁的上游 v0.8.0 上，`TestCreateSessionRevisedTimeout`）：
+- **探针证据**（在 v0.9.3 上把三个常量撤回毫秒数值后，`TestCreateSessionRevisedTimeout` 的九个用例全部失败）：
   ```
   the client was told the session timeout is 0s, want 2m0s
   the server stored the session timeouts [60µs], want exactly one of 2m0s
   ```
-  请求 120 秒、500 毫秒、100 毫秒、30 分钟、0、负数、50 毫秒、31 分钟，服务端存下的**全是 60µs**，
+  请求 120 秒、500 毫秒、100 毫秒、1 小时、2 小时、0、负数、50 毫秒，服务端存下的**全是 60µs**，
   回给客户端的**全是 0ms**。只有请求恰好是 1 毫秒时原样保留。
 
-  | 客户端请求 | 修前：服务端存储 | 修前：`RevisedSessionTimeout` | 修后：存储与响应 |
+  | 客户端请求 | 撤掉修复：服务端存储 | 撤掉修复：`RevisedSessionTimeout` | 上游 v0.9.3 的修复：存储与响应 |
   |---|---|---|---|
   | 120s | 60µs | 0ms | 120s |
   | 500ms | 60µs | 0ms | 500ms |
   | 100ms | 60µs | 0ms | 100ms |
-  | 30min | 60µs | 0ms | 30min |
-  | 0、负数、50ms、31min | 60µs | 0ms | 60s（默认值） |
+  | 1h（上限） | 60µs | 0ms | 1h |
+  | 2h、0、负数、50ms | 60µs | 0ms | 60s（默认值） |
   | 1ms | 1ms | 1ms | 60s（默认值） |
 
 - **对客户端可见的影响**：`CreateSessionResponse.RevisedSessionTimeout` 从 0ms 变成服务端实际授予的值。
@@ -571,17 +572,17 @@ SagooIoT 的南向采集插件 `plugins/opcua` 是独立模块，生产构建用
   Variant 和 DiagnosticInfo 每层在线上只占 1 个字节。
 - **触发条件**：一条约 1 MB 的请求，不需要会话。解码发生在 `uasc.SecureChannel.Receive` 里，
   早于 P6 的会话校验。
-- **探针证据**（未打补丁时，每个深度各占一个进程；下表在上游 v0.8.0 上测得，v0.9.3 没有给这条递归加上限）：
+- **探针证据**（2026-11-26 在未打补丁的上游 v0.9.3 上实测，每个深度各占一个进程）：
 
   | 嵌套路径 | 每层线上开销 | 表现 |
   |---|---|---|
-  | Variant 套 Variant | 1 字节 | 90 万层正常返回；100 万层 `fatal error: stack overflow` |
-  | Variant → DataValue → Variant | 2 字节 | 50 万层正常；100 万层（200 万字节，在 2 MB 报文上限之内）栈溢出 |
-  | DiagnosticInfo 套 DiagnosticInfo | 1 字节 | 200 万层仍正常返回，但递归无界 |
-  | Variant → ExtensionObject → Variant | 10 字节 | 20 万层（2 MB）解码成功 |
-  | ExtensionObject 套 ExtensionObject | 9 字节 | 23.3 万层（2,097,000 字节）不崩，但解码协程的栈从 295 KB 涨到 537,526,272 字节；40 万层栈溢出 |
+  | Variant 套 Variant | 1 字节 | 90 万层（900,005 字节）正常返回，解码协程的栈涨到 537,296,896 字节；100 万层 `fatal error: stack overflow` |
+  | Variant → DataValue → Variant | 2 字节 | 50 万层正常返回；100 万层（2,000,005 字节，贴着 2 MB 报文上限）栈溢出 |
+  | DiagnosticInfo 套 DiagnosticInfo | 1 字节 | 200 万层（2,000,001 字节）仍正常返回，栈涨到 537,264,128 字节，递归无界 |
+  | Variant → 扩展对象（`KeyValuePair`，带 Variant 字段）→ Variant | 16 字节 | 12.5 万层（2,000,005 字节）解码成功，栈涨到 537,526,272 字节；25 万层（4 MB）栈溢出 |
 
-  栈溢出是 `fatal error`，`recover` 接不住。
+  栈溢出是 `fatal error`，`recover` 接不住。TypeId 直接指向 `ExtensionObject` 自己（i=22）的报文不递归：
+  注册表里没有这一项，解码到第一层就停。扩展对象的嵌套要经一个已注册的类型，由它带出 Variant 或 ExtensionObject 字段。
 - **为什么范围比「两个文件」大**：
   1. 所有嵌套值都经 `Buffer.ReadStruct` 重新进入各自的 `Decode`，而每个手写解码器一进来就新建缓冲区。
      只给 `Variant.Decode` 和 `DiagnosticInfo.Decode` 加深度参数，深度一进 `DataValue` 或
