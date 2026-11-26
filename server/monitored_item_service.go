@@ -184,8 +184,11 @@ func (s *MonitoredItemService) CreateMonitoredItems(sc *uasc.SecureChannel, r ua
 		return nil, errors.New("sub doesn't exist")
 	}
 
+	// The session can be nil here: it may have timed out (P7) between
+	// handleService checking it and this lookup.
 	sess := s.SubService.srv.Session(req.RequestHeader)
-	if sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
+	if sess == nil || sess.AuthTokenID == nil || sub.Session == nil || sub.Session.AuthTokenID == nil ||
+		sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
 		return nil, errors.New("not your subscription, bro")
 	}
 
@@ -282,18 +285,12 @@ func (s *MonitoredItemService) SetMonitoringMode(sc *uasc.SecureChannel, r ua.Re
 
 	for i := range req.MonitoredItemIDs {
 		id := req.MonitoredItemIDs[i]
-		item, ok := s.Items[id]
-
-		if item.Sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
-			results[i] = ua.StatusBadSessionIDInvalid
-		}
-
-		if !ok {
-			results[i] = ua.StatusBadMonitoredItemIDInvalid
+		status := s.itemStatus(id, sess)
+		results[i] = status
+		if status != ua.StatusOK {
 			continue
 		}
-		item.Mode = req.MonitoringMode
-		results[i] = ua.StatusOK
+		s.Items[id].Mode = req.MonitoringMode
 	}
 
 	return &ua.SetMonitoringModeResponse{
@@ -324,6 +321,28 @@ func (s *MonitoredItemService) SetTriggering(sc *uasc.SecureChannel, r ua.Reques
 	return serviceUnsupported(req.RequestHeader), nil
 }
 
+// itemStatus returns the status a per-item result carries for the monitored
+// item with the given id: StatusOK when it exists and belongs to the session,
+// BadMonitoredItemIDInvalid when there is no such item and
+// BadSessionIDInvalid when another session owns it.
+//
+// The caller must hold Mu. handleService already rejects requests without a
+// session (P6); the nil check on sess is kept because these handlers used to
+// dereference it, and an unknown item id used to be dereferenced as well,
+// which killed the process (P5).
+func (s *MonitoredItemService) itemStatus(id uint32, sess *session) ua.StatusCode {
+	item, ok := s.Items[id]
+	if !ok {
+		return ua.StatusBadMonitoredItemIDInvalid
+	}
+	owner := item.Sub
+	if sess == nil || sess.AuthTokenID == nil || owner == nil || owner.Session == nil || owner.Session.AuthTokenID == nil ||
+		owner.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
+		return ua.StatusBadSessionIDInvalid
+	}
+	return ua.StatusOK
+}
+
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.13.6
 func (s *MonitoredItemService) DeleteMonitoredItems(sc *uasc.SecureChannel, r ua.Request, reqID uint32) (ua.Response, error) {
 	if s.SubService.srv.cfg.logger != nil {
@@ -343,18 +362,14 @@ func (s *MonitoredItemService) DeleteMonitoredItems(sc *uasc.SecureChannel, r ua
 	results := make([]ua.StatusCode, len(req.MonitoredItemIDs))
 	for i := range req.MonitoredItemIDs {
 		id := req.MonitoredItemIDs[i]
-		item, ok := s.Items[id]
-		if !ok {
-			results[i] = ua.StatusBadMonitoredItemIDInvalid
-		}
-
-		if item.Sub.Session.AuthTokenID.String() != sess.AuthTokenID.String() {
-			results[i] = ua.StatusBadSessionIDInvalid
+		status := s.itemStatus(id, sess)
+		results[i] = status
+		if status != ua.StatusOK {
+			continue
 		}
 
 		// this function gets the lock so we need to do it in the background so it can happen after our lock is released.
 		go s.DeleteMonitoredItem(id)
-		results[i] = ua.StatusOK
 	}
 
 	response := &ua.DeleteMonitoredItemsResponse{

@@ -37,7 +37,21 @@ type DataValue struct {
 }
 
 func (d *DataValue) Decode(b []byte) (int, error) {
+	return d.decodeNested(b, 0)
+}
+
+// decodeNested decodes a DataValue that has depth levels of Variants,
+// DiagnosticInfos and ExtensionObjects around it. A DataValue only wraps a
+// Variant and is no level of nesting itself, so the Variant inside gets the
+// depth this one was given.
+//
+// Carrying the depth through matters. This function starts a buffer of its
+// own; left at zero there, a Variant in a DataValue in a Variant began at the
+// top again, and two bytes on the wire were enough to undo the nesting limit
+// (P12).
+func (d *DataValue) decodeNested(b []byte, depth int) (int, error) {
 	buf := NewBuffer(b)
+	buf.depth = depth
 	d.EncodingMask = buf.ReadByte()
 	d.Value = new(Variant)
 	if d.Has(DataValueValue) {

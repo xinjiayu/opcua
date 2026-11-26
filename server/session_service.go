@@ -3,7 +3,6 @@ package server
 import (
 	"crypto/rand"
 	"log"
-	"strings"
 	"time"
 
 	"github.com/gopcua/opcua/ua"
@@ -36,13 +35,10 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		return nil, err
 	}
 
-	// New session
-	sess := s.srv.sb.NewSession()
-
 	// Ensure session timeout is reasonable
-	sess.cfg.sessionTimeout = time.Duration(req.RequestedSessionTimeout) * time.Millisecond
-	if sess.cfg.sessionTimeout > sessionTimeoutMax || sess.cfg.sessionTimeout < sessionTimeoutMin {
-		sess.cfg.sessionTimeout = sessionTimeoutDefault
+	timeout := time.Duration(req.RequestedSessionTimeout) * time.Millisecond
+	if timeout > sessionTimeoutMax || timeout < sessionTimeoutMin {
+		timeout = sessionTimeoutDefault
 	}
 
 	nonce := make([]byte, sessionNonceLength)
@@ -50,8 +46,6 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		log.Printf("error creating session nonce")
 		return nil, ua.StatusBadInternalError
 	}
-	sess.serverNonce = nonce
-	sess.remoteCertificate = req.ClientCertificate
 
 	sig, alg, err := sc.NewSessionSignature(req.ClientCertificate, req.ClientNonce)
 	if err != nil {
@@ -59,15 +53,20 @@ func (s *SessionService) CreateSession(sc *uasc.SecureChannel, r ua.Request, req
 		return nil, ua.StatusBadInternalError
 	}
 
-	matching_endpoints := make([]*ua.EndpointDescription, 0)
-	reqTrimmedURL, _ := strings.CutSuffix(req.EndpointURL, "/")
-	for i := range s.srv.endpoints {
-		ep := s.srv.endpoints[i]
-		epTrimmedURL, _ := strings.CutSuffix(ep.EndpointURL, "/")
-		if epTrimmedURL == reqTrimmedURL {
-			matching_endpoints = append(matching_endpoints, ep)
-		}
+	// New session, only now that nothing else can fail. A session left in the
+	// broker would count against the session limit until it times out, and a
+	// client can make the steps above fail.
+	sess := s.srv.sb.NewSession(timeout)
+	if sess == nil {
+		return nil, ua.StatusBadTooManySessions
 	}
+	sess.serverNonce = nonce
+	sess.remoteCertificate = req.ClientCertificate
+
+	// The address selects by scheme and port, as in GetEndpoints. Upstream
+	// compared it with the configured endpoint URL character for character,
+	// which left a client arriving by a host name with an empty list (P8).
+	matching_endpoints := s.srv.endpointsFor(req.EndpointURL)
 
 	response := &ua.CreateSessionResponse{
 		ResponseHeader:        responseHeader(req.RequestHeader.RequestHandle, ua.StatusOK),
@@ -139,12 +138,28 @@ func (s *SessionService) CloseSession(sc *uasc.SecureChannel, r ua.Request, reqI
 		return nil, err
 	}
 
+	// The subscriptions of the session hang off the session object, which the
+	// close that follows takes out of the broker, so look it up first.
+	sess := s.srv.sb.lookup(req.RequestHeader.AuthenticationToken)
+
 	err = s.srv.sb.Close(req.RequestHeader.AuthenticationToken)
 	if err != nil {
 		return nil, ua.StatusBadSessionIDInvalid
 	}
 
-	//TODO: deal with 'delete subscriptions' field in request
+	// OPC UA Part 4, 5.6.4: with DeleteSubscriptions set, a closed session
+	// takes its subscriptions and monitored items with it. Upstream left them
+	// registered until each had run through its lifetime count (P11).
+	//
+	// The session is out of the broker by now, so nothing can be added to it
+	// any more and the removal sees everything that belonged to it. The
+	// removal runs in the background, as the DeleteSubscriptions handler does
+	// it: it takes locks that a stalled change delivery may hold, and the
+	// request closing a session should not wait on those.
+	if req.DeleteSubscriptions && sess != nil {
+		go s.srv.deleteSubscriptionsOf(sess)
+	}
+
 	response := &ua.CloseSessionResponse{
 		ResponseHeader: responseHeader(req.RequestHeader.RequestHandle, ua.StatusOK),
 	}

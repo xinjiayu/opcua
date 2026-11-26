@@ -31,7 +31,21 @@ type DiagnosticInfo struct {
 }
 
 func (d *DiagnosticInfo) Decode(b []byte) (int, error) {
+	return d.decodeNested(b, 0)
+}
+
+// decodeNested decodes a DiagnosticInfo that has depth levels of Variants,
+// DiagnosticInfos and ExtensionObjects around it. Each inner DiagnosticInfo
+// is one step of recursion here, so the depth is capped at maxNestingDepth
+// (P12).
+func (d *DiagnosticInfo) decodeNested(b []byte, depth int) (int, error) {
+	if depth > maxNestingDepth {
+		return 0, errTooDeeplyNested
+	}
+
 	buf := NewBuffer(b)
+	// an inner DiagnosticInfo sits one level deeper
+	buf.depth = depth + 1
 	d.EncodingMask = buf.ReadByte()
 	if d.Has(DiagnosticInfoSymbolicID) {
 		d.SymbolicID = buf.ReadInt32()

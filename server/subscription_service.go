@@ -2,12 +2,37 @@ package server
 
 import (
 	"context"
+	"log"
+	"math"
+	"runtime/debug"
 	"sync"
 	"time"
 
 	"github.com/gopcua/opcua/ua"
 	"github.com/gopcua/opcua/uasc"
 )
+
+// Bounds of the publishing interval the server runs a subscription with, in
+// milliseconds. OPC UA Part 4, 5.13.2 lets the server revise a requested
+// interval it cannot honour.
+const (
+	minPublishingIntervalMS = 100.0     // 100 ms
+	maxPublishingIntervalMS = 3600000.0 // 1 h
+)
+
+// clampPublishingInterval returns the publishing interval the server uses for
+// a requested one, in milliseconds. The interval ends up in time.NewTicker,
+// which panics on everything but a positive number of nanoseconds, so NaN and
+// the infinities are treated like an interval below the minimum.
+func clampPublishingInterval(ms float64) float64 {
+	switch {
+	case math.IsNaN(ms) || ms < minPublishingIntervalMS:
+		return minPublishingIntervalMS
+	case ms > maxPublishingIntervalMS:
+		return maxPublishingIntervalMS
+	}
+	return ms
+}
 
 // SubscriptionService implements the Subscription Service Set.
 //
@@ -17,6 +42,27 @@ type SubscriptionService struct {
 	// pub sub stuff
 	Mu   sync.Mutex
 	Subs map[uint32]*Subscription
+
+	// nextSubID is the number the subscription created next gets. It only
+	// grows. Upstream took "number of subscriptions held + 1", so after one
+	// was deleted the next one got the number of another, live, subscription
+	// and replaced it (P9).
+	nextSubID uint32
+}
+
+// nextSubscriptionID returns a number no subscription is registered under.
+// The caller must hold Mu.
+func (s *SubscriptionService) nextSubscriptionID() uint32 {
+	for {
+		s.nextSubID++
+		if s.nextSubID == 0 {
+			// zero is not a valid subscription number
+			s.nextSubID = 1
+		}
+		if _, taken := s.Subs[s.nextSubID]; !taken {
+			return s.nextSubID
+		}
+	}
 }
 
 // get rid of all references to a subscription and all monitored items that are pointed at this subscription.
@@ -34,6 +80,9 @@ func (s *SubscriptionService) DeleteSubscription(id uint32) {
 		sub.Mu.Unlock()
 	}
 
+	if ok && sub.Session != nil {
+		s.srv.sb.subscriptionRemoved(sub.Session)
+	}
 	delete(s.Subs, id)
 
 	// ask the monitored item service to purge out any items that use this subscription
@@ -55,7 +104,20 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 	s.Mu.Lock()
 	defer s.Mu.Unlock()
 
-	newsubid := uint32(len(s.Subs)) + 1
+	// handleService rejects requests without a session before they get here
+	// (P6). Keep this check as a second line of defence: run() dereferences
+	// the session on its keepalive path, in a goroutine.
+	//
+	// The lookup sits under the lock on purpose. The expiry sweep (P7) takes
+	// a session out of the broker first and collects its subscriptions after
+	// that, so a subscription registered here for a session that is still in
+	// the broker is one the sweep is going to see.
+	session := s.srv.Session(r.Header())
+	if session == nil {
+		return nil, ua.StatusBadSessionIDInvalid
+	}
+
+	newsubid := s.nextSubscriptionID()
 
 	if s.srv.cfg.logger != nil {
 		s.srv.cfg.logger.Info("New Sub %d for %v", newsubid, sc.RemoteAddr())
@@ -63,14 +125,18 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 
 	sub := NewSubscription()
 	sub.srv = s
-	sub.Session = s.srv.Session(r.Header())
+	sub.Session = session
 	sub.Channel = sc
 	sub.ID = newsubid
-	sub.RevisedPublishingInterval = req.RequestedPublishingInterval
+	// The interval feeds time.NewTicker in run(), which panics on anything
+	// but a positive duration. Upstream passed the requested value through
+	// unchanged, so 0, negative, NaN or overflowing values killed the process.
+	sub.RevisedPublishingInterval = clampPublishingInterval(req.RequestedPublishingInterval)
 	sub.RevisedLifetimeCount = req.RequestedLifetimeCount
 	sub.RevisedMaxKeepAliveCount = req.RequestedMaxKeepAliveCount
 
 	s.Subs[newsubid] = sub
+	s.srv.sb.subscriptionAdded(session)
 	sub.running = true
 	sub.Start()
 
@@ -84,7 +150,7 @@ func (s *SubscriptionService) CreateSubscription(sc *uasc.SecureChannel, r ua.Re
 			AdditionalHeader:   ua.NewExtensionObject(nil),
 		},
 		SubscriptionID:            uint32(newsubid),
-		RevisedPublishingInterval: req.RequestedPublishingInterval,
+		RevisedPublishingInterval: sub.RevisedPublishingInterval,
 		RevisedLifetimeCount:      req.RequestedLifetimeCount,
 		RevisedMaxKeepAliveCount:  req.RequestedMaxKeepAliveCount,
 	}
@@ -220,6 +286,13 @@ func (s *SubscriptionService) DeleteSubscriptions(sc *uasc.SecureChannel, r ua.R
 		if s.srv.cfg.logger != nil {
 			s.srv.cfg.logger.Info("Subscription %d deleted by client", subid)
 		}
+		// handleService rejects requests without a session before they get
+		// here (P6). Keep this check: the session used to be dereferenced
+		// without one, which killed the process.
+		if session == nil {
+			results[i] = ua.StatusBadSessionIDInvalid
+			continue
+		}
 		sub, ok := s.Subs[subid]
 		if !ok {
 			results[i] = ua.StatusBadSubscriptionIDInvalid
@@ -300,7 +373,22 @@ func (s *Subscription) Update(req *ua.ModifySubscriptionRequest) {
 }
 
 func (s *Subscription) Start() {
-	go s.run()
+	go func() {
+		// A panic in this goroutine cannot be caught by whoever called Start().
+		// Without the recover it ended the whole process. By the time the
+		// recover runs, run() has already removed the subscription.
+		defer func() {
+			if r := recover(); r != nil {
+				const format = "Subscription %d: recovered from panic in the publishing goroutine: %v\n%s"
+				if s.srv != nil && s.srv.srv != nil && s.srv.srv.cfg.logger != nil {
+					s.srv.srv.cfg.logger.Error(format, s.ID, r, debug.Stack())
+				} else {
+					log.Printf(format, s.ID, r, debug.Stack())
+				}
+			}
+		}()
+		s.run()
+	}()
 
 }
 

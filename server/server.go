@@ -267,6 +267,8 @@ func (s *Server) Start(ctx context.Context) error {
 
 	go s.acceptAndRegister(ctx, s.l)
 	go s.monitorConnections(ctx)
+	// the context that opened the endpoints also ends the expiry sweep
+	go s.reapSessions(ctx)
 
 	return nil
 }

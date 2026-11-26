@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"io"
 	"math"
+	"reflect"
 	"time"
 
 	"github.com/gopcua/opcua/errors"
@@ -33,6 +34,11 @@ type Buffer struct {
 	buf []byte
 	pos int
 	err error
+
+	// depth is how many Variants, DiagnosticInfos and ExtensionObjects enclose
+	// the values read through this buffer. ReadStruct passes it on to whatever
+	// decodes a nested value. See maxNestingDepth in decode.go.
+	depth int
 }
 
 func NewBuffer(b []byte) *Buffer {
@@ -176,10 +182,14 @@ func (b *Buffer) ReadStruct(r interface{}) {
 	var n int
 	var err error
 	switch x := r.(type) {
+	case depthAware:
+		// a Variant, a DiagnosticInfo or a wrapper around one: it has to know
+		// how deep it is (P12)
+		n, err = x.decodeNested(b.buf[b.pos:], b.depth)
 	case BinaryDecoder:
 		n, err = x.Decode(b.buf[b.pos:])
 	default:
-		n, err = Decode(b.buf[b.pos:], r)
+		n, err = decode(b.buf[b.pos:], reflect.ValueOf(r), reflect.TypeOf(r).String(), b.depth)
 	}
 	if err != nil {
 		b.err = err
