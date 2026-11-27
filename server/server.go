@@ -67,6 +67,10 @@ type serverConfig struct {
 	enabledSec  []security
 	enabledAuth []authMode
 
+	// userAuth validates username/password for UserNameIdentityToken.
+	// nil rejects every username login with BadUserAccessDenied.
+	userAuth UserAuthFunc
+
 	cap ServerCapabilities
 
 	logger Logger

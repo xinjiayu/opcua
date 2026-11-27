@@ -110,6 +110,12 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 		return nil, ua.StatusBadSecurityChecksFailed
 	}
 
+	// Authenticate before rotating the server nonce: the password ciphertext
+	// (Part 4, UserNameIdentityToken) is sealed with the CreateSession nonce.
+	if err := s.authenticate(sc, sess, req); err != nil {
+		return nil, err
+	}
+
 	nonce := make([]byte, sessionNonceLength)
 	if _, err := rand.Read(nonce); err != nil {
 		log.Printf("error creating session nonce")
@@ -125,6 +131,87 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 	}
 
 	return response, nil
+}
+
+// authenticate checks the UserIdentityToken against enabled auth modes and,
+// for username tokens, the configured UserAuth callback.
+func (s *SessionService) authenticate(sc *uasc.SecureChannel, sess *session, req *ua.ActivateSessionRequest) error {
+	tokenType, username, password, err := s.identityFrom(sc, sess, req)
+	if err != nil {
+		return err
+	}
+	if !s.authModeEnabled(tokenType) {
+		return ua.StatusBadIdentityTokenRejected
+	}
+	switch tokenType {
+	case ua.UserTokenTypeAnonymous:
+		return nil
+	case ua.UserTokenTypeUserName:
+		fn := s.srv.cfg.userAuth
+		if fn == nil {
+			return ua.StatusBadUserAccessDenied
+		}
+		if err := fn(username, password); err != nil {
+			return ua.StatusBadUserAccessDenied
+		}
+		return nil
+	default:
+		return ua.StatusBadIdentityTokenRejected
+	}
+}
+
+func (s *SessionService) authModeEnabled(tokenType ua.UserTokenType) bool {
+	for _, a := range s.srv.cfg.enabledAuth {
+		if a.tokenType == tokenType {
+			return true
+		}
+	}
+	return false
+}
+
+// identityFrom unwraps the ActivateSession UserIdentityToken and, for
+// UserNameIdentityToken, decrypts the password with the channel key material.
+func (s *SessionService) identityFrom(sc *uasc.SecureChannel, sess *session, req *ua.ActivateSessionRequest) (ua.UserTokenType, string, string, error) {
+	if req.UserIdentityToken == nil || req.UserIdentityToken.Value == nil {
+		return 0, "", "", ua.StatusBadIdentityTokenInvalid
+	}
+	switch tok := req.UserIdentityToken.Value.(type) {
+	case *ua.AnonymousIdentityToken:
+		return ua.UserTokenTypeAnonymous, "", "", nil
+	case *ua.UserNameIdentityToken:
+		// Empty EncryptionAlgorithm means the password is in the clear
+		// (None policy, or a client that skipped encryption).
+		policyURI := ua.SecurityPolicyURINone
+		if tok.EncryptionAlgorithm != "" {
+			policyURI = s.userTokenPolicyURI(tok.PolicyID)
+			// empty Policy SecurityPolicyURI → Decrypt falls back to channel policy
+		}
+		pass, err := sc.DecryptUserPassword(policyURI, tok.Password, sess.serverNonce)
+		if err != nil {
+			return 0, "", "", ua.StatusBadIdentityTokenInvalid
+		}
+		return ua.UserTokenTypeUserName, tok.UserName, pass, nil
+	default:
+		return 0, "", "", ua.StatusBadIdentityTokenInvalid
+	}
+}
+
+// userTokenPolicyURI looks up the SecurityPolicyURI advertised for a PolicyID.
+// Unknown IDs return "" so DecryptUserPassword falls back to the channel policy.
+func (s *SessionService) userTokenPolicyURI(policyID string) string {
+	if policyID == "" {
+		return ""
+	}
+	s.srv.mu.Lock()
+	defer s.srv.mu.Unlock()
+	for _, ep := range s.srv.endpoints {
+		for _, uit := range ep.UserIdentityTokens {
+			if uit != nil && uit.PolicyID == policyID {
+				return uit.SecurityPolicyURI
+			}
+		}
+	}
+	return ""
 }
 
 // https://reference.opcfoundation.org/Core/Part4/v105/docs/5.6.4

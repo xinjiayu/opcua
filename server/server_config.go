@@ -96,6 +96,18 @@ func EnableSecurity(secPolicy string, secMode ua.MessageSecurityMode) Option {
 // EnableAuthMode registers a new user authentication mode to the server.
 // All AuthModes except Anonymous require encryption by default, so EnableSecurity()
 // must also be called with at least one non-"None" SecurityPolicy
+// UserAuthFunc validates a username/password pair during ActivateSession.
+// Return nil to accept the identity; any error rejects with BadUserAccessDenied.
+type UserAuthFunc func(username, password string) error
+
+// UserAuth registers the callback used to authenticate UserNameIdentityToken.
+// Without this option, username logins are rejected.
+func UserAuth(fn UserAuthFunc) Option {
+	return func(s *serverConfig) {
+		s.userAuth = fn
+	}
+}
+
 func EnableAuthMode(tokenType ua.UserTokenType) Option {
 	return func(s *serverConfig) {
 

@@ -2,7 +2,7 @@
 
 本仓库是 `github.com/gopcua/opcua` 的 fork，带有安全补丁。
 
-- **`sagooiot-v0.9.3`**：当前使用的分支，从上游标签 `v0.9.3` 拉出，发布标签 `v0.9.3-sagooiot.1`。本文件描述的就是它。
+- **`sagooiot-v0.9.3`**：当前使用的分支，从上游标签 `v0.9.3` 拉出，发布标签 `v0.9.3-sagooiot.2`（前一版 `v0.9.3-sagooiot.1`）。本文件描述的就是它。
 - **`sagooiot-v0.8.0`**：较早的分支，从上游标签 `v0.8.0` 拉出，发布标签 `v0.8.0-sagooiot.1`，保留作回退。
   带全部 14 条补丁（含上游后来才修的 P1、P3、P7a），两处行为与上游不同，行号也与本文件不同。
 - **`main`**：原样镜像上游，不带补丁。
@@ -18,7 +18,7 @@
   （例如 `golang.org/x/exp@v0.0.0-20241204233417-43b7b7cde48d`、`golang.org/x/term@v0.27.0`、`testify@v1.10.0`）。
   使用方选中的是更高的版本，所以这些版本不一定在模块缓存里。缓存里没有的时候，
   离线环境下 `go build` 或 `go test` 会在拉取依赖时失败。这与补丁无关。
-- 本分支带 11 条补丁（P2、P4–P13），源码改动集中在 15 个文件里，全部在下表列出。
+- 本分支带 12 条补丁（P2、P4–P14），源码改动集中在下表列出的文件里。
   P1、P3、P7a 上游在 v0.9.3 里已经修了，本分支不含这三条改动，只保留它们的测试作回归用例。
   新增的测试全部以 `patch_` 开头，上游没有同名文件，合并上游时不会冲突。
 - `go vet ./server/ ./ua/` 在**未改动的上游代码**上就不过：`ua/buffer.go:71`、`:249` 的
@@ -71,9 +71,10 @@ go vet -stdmethods=false github.com/gopcua/opcua/server github.com/gopcua/opcua/
 | P11 | `CloseSession` 不处理 `DeleteSubscriptions` | 资源泄漏 | `server/session_service.go` | 未修 |
 | P12 | 解码递归没有深度上限 | 崩溃 / 资源耗尽 | `ua/decode.go`、`ua/buffer.go`、`ua/variant.go` 等 6 个 | 未修 |
 | P13 | `FindServers` 不检查端点列表 | 崩溃 | `server/discovery_service.go` | 未修 |
+| P14 | `ActivateSession` 不校验用户名口令 | 越权 | `server/session_service.go`、`server/server_config.go`、`server/server.go`、`uasc/secure_channel_crypto.go` | 未修 |
 
 「上游 v0.9.3」一列由主控在 2026-11-26 对照 v0.9.3 的源码逐条核对：只有 P1、P3、P7a 上游已修，
-其余十一项都还在，上游主干（未发版的 `main`）同样没修。本分支基于 v0.9.3，所以只带后面这 11 条。
+其余（含 P14）都还在，上游主干（未发版的 `main`）同样没修。本分支基于 v0.9.3，所以只带这些补丁。
 
 换基线时记下的事实：v0.9.3 相对 v0.8.0 改了客户端一侧的 6 个文件（`client.go`、`client_sub.go`、
 `config.go`、`node.go`、`subscription.go`、`monitor/subscription.go`）以及 `uasc`、`uapolicy`、`ua`、
@@ -820,12 +821,27 @@ P1、P3、P7a 的行为由上游 v0.9.3 提供，本分支没有改动。和 `sa
    `Buffer` 多了一个字段，四个手写解码器各多了一个内部方法 `decodeNested`。上游动过这些函数的话，
    这一条要手工合并，不能只按行号套用。
 
+## 3.x P14 — ActivateSession 用户名口令校验
+
+**问题**：`ActivateSession` 只校验会话签名并轮换 nonce，从不读取 `UserIdentityToken`。
+端点即使声明了 Username、或关掉了 Anonymous，任何客户端仍能建会话。
+
+**修复**：
+- 新增 `server.UserAuth(fn)`：在 `ActivateSession` 里解析 `AnonymousIdentityToken` /
+  `UserNameIdentityToken`；未启用的令牌类型 → `BadIdentityTokenRejected`；
+  用户名口令经回调校验失败 → `BadUserAccessDenied`。
+- `uasc.SecureChannel.DecryptUserPassword`：按 Part 4 布局（length + password + serverNonce）
+  解密口令；必须在轮换 serverNonce **之前**校验。
+- 端点 `UserIdentityTokens` 仍由 `EnableAuthMode` 驱动：未启用 Anonymous 则不声明匿名策略。
+
+**测试**：`server/patch_p14_username_auth_test.go`、`uasc/decrypt_user_password_test.go`。
+
 ## 9. 使用方怎么更新
 
 使用方在自己的 `go.mod` 里用 `replace` 钉在本仓库的**标签**上：
 
 ```go.mod
-replace github.com/gopcua/opcua => github.com/xinjiayu/opcua v0.9.3-sagooiot.1
+replace github.com/gopcua/opcua => github.com/xinjiayu/opcua v0.9.3-sagooiot.2
 ```
 
 标签就是发布点：`v<上游基线>-sagooiot.<N>` 同时写明上游基线和补丁轮次，每个标签对应第 3 节的一套
