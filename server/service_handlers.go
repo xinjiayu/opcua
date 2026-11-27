@@ -36,6 +36,14 @@ var sessionlessServices = map[uint16]struct{}{
 	id.ActivateSessionRequest_Encoding_DefaultBinary:      {},
 }
 
+// preActivationServices may run against a CreateSession result that has not
+// yet passed ActivateSession. CloseSession must stay usable so clients can
+// drop an abandoned half-open session without authenticating (P15).
+var preActivationServices = map[uint16]struct{}{
+	id.ActivateSessionRequest_Encoding_DefaultBinary: {},
+	id.CloseSessionRequest_Encoding_DefaultBinary:    {},
+}
+
 func (s *Server) initHandlers() {
 	// s.registerHandlerFunc(id.ServiceFault_Encoding_DefaultBinary, handleServiceFault)
 
@@ -142,7 +150,20 @@ func (s *Server) handleService(ctx context.Context, sc *uasc.SecureChannel, reqI
 		// A request that names a session the server knows counts as activity
 		// and starts the timeout of that session over.
 		s.sb.touch(sess)
-		resp, err = h(sc, req, reqID)
+		// P15: CreateSession alone must not authorize Read/Write/Browse.
+		// ActivateSession sets sess.activated after identity checks pass.
+		if !sess.activated {
+			if _, ok := preActivationServices[typeID]; !ok {
+				if s.cfg.logger != nil {
+					s.cfg.logger.Debug("handleService: rejected %T, session not activated\n", req)
+				}
+				err = ua.StatusBadSessionNotActivated
+			} else {
+				resp, err = h(sc, req, reqID)
+			}
+		} else {
+			resp, err = h(sc, req, reqID)
+		}
 	} else if _, sessionless := sessionlessServices[typeID]; !sessionless {
 		// OPC UA Part 4: everything but discovery and setting up the session
 		// needs a session the server knows. Upstream ran the handler anyway,

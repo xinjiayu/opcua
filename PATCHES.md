@@ -2,7 +2,7 @@
 
 本仓库是 `github.com/gopcua/opcua` 的 fork，带有安全补丁。
 
-- **`sagooiot-v0.9.3`**：当前使用的分支，从上游标签 `v0.9.3` 拉出，发布标签 `v0.9.3-sagooiot.2`（前一版 `v0.9.3-sagooiot.1`）。本文件描述的就是它。
+- **`sagooiot-v0.9.3`**：当前使用的分支，从上游标签 `v0.9.3` 拉出，发布标签 `v0.9.3-sagooiot.3`（前一版 `v0.9.3-sagooiot.2`）。本文件描述的就是它。
 - **`sagooiot-v0.8.0`**：较早的分支，从上游标签 `v0.8.0` 拉出，发布标签 `v0.8.0-sagooiot.1`，保留作回退。
   带全部 14 条补丁（含上游后来才修的 P1、P3、P7a），两处行为与上游不同，行号也与本文件不同。
 - **`main`**：原样镜像上游，不带补丁。
@@ -18,7 +18,7 @@
   （例如 `golang.org/x/exp@v0.0.0-20241204233417-43b7b7cde48d`、`golang.org/x/term@v0.27.0`、`testify@v1.10.0`）。
   使用方选中的是更高的版本，所以这些版本不一定在模块缓存里。缓存里没有的时候，
   离线环境下 `go build` 或 `go test` 会在拉取依赖时失败。这与补丁无关。
-- 本分支带 12 条补丁（P2、P4–P14），源码改动集中在下表列出的文件里。
+- 本分支带 13 条补丁（P2、P4–P15），源码改动集中在下表列出的文件里。
   P1、P3、P7a 上游在 v0.9.3 里已经修了，本分支不含这三条改动，只保留它们的测试作回归用例。
   新增的测试全部以 `patch_` 开头，上游没有同名文件，合并上游时不会冲突。
 - `go vet ./server/ ./ua/` 在**未改动的上游代码**上就不过：`ua/buffer.go:71`、`:249` 的
@@ -72,6 +72,7 @@ go vet -stdmethods=false github.com/gopcua/opcua/server github.com/gopcua/opcua/
 | P12 | 解码递归没有深度上限 | 崩溃 / 资源耗尽 | `ua/decode.go`、`ua/buffer.go`、`ua/variant.go` 等 6 个 | 未修 |
 | P13 | `FindServers` 不检查端点列表 | 崩溃 | `server/discovery_service.go` | 未修 |
 | P14 | `ActivateSession` 不校验用户名口令 | 越权 | `server/session_service.go`、`server/server_config.go`、`server/server.go`、`uasc/secure_channel_crypto.go` | 未修 |
+| P15 | 未激活会话可 Read/Write（CreateSession 后跳过 ActivateSession） | 越权 | `server/session_broker.go`、`server/session_service.go`、`server/service_handlers.go` | 未修 |
 
 「上游 v0.9.3」一列由主控在 2026-11-26 对照 v0.9.3 的源码逐条核对：只有 P1、P3、P7a 上游已修，
 其余（含 P14）都还在，上游主干（未发版的 `main`）同样没修。本分支基于 v0.9.3，所以只带这些补丁。

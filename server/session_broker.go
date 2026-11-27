@@ -19,6 +19,10 @@ type session struct {
 	serverNonce       []byte
 	remoteCertificate []byte
 
+	// activated is set by ActivateSession after identity checks pass.
+	// CreateSession alone must not authorize Read/Write/Browse (P15).
+	activated bool
+
 	// lastActivity is when the session last carried a request. It is read by
 	// the expiry sweep that Server.Start runs and is guarded by the mutex of
 	// the session broker.

@@ -115,6 +115,7 @@ func (s *SessionService) ActivateSession(sc *uasc.SecureChannel, r ua.Request, r
 	if err := s.authenticate(sc, sess, req); err != nil {
 		return nil, err
 	}
+	sess.activated = true
 
 	nonce := make([]byte, sessionNonceLength)
 	if _, err := rand.Read(nonce); err != nil {
